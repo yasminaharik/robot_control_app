@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 name: robot_control_app
 description: "SmartFetchBot mobile controller app."
 publish_to: 'none'
@@ -22,3 +23,29 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+=======
+name: robot_control_app
+description: "SmartFetchBot mobile controller app."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  http: ^0.13.6
+  shared_preferences: ^2.2.2
+  flutter_bluetooth_serial: ^0.4.0
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+>>>>>>> 12d6f0390718c02b8f6c8f10b64de7e7db885692
