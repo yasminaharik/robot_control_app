@@ -48,10 +48,25 @@ class ApiService {
     return http.delete(Uri.parse("$base$path"));
   }
 
-  // ── frame URL ─────────────────────────────────────────────────────────────
-  static Future<String> getFrameUrl() async {
+  // ── WebRTC signaling ──────────────────────────────────────────────────────
+  /// Send SDP offer to Pi, get SDP answer back
+  /// POST /webrtc/offer  { "sdp": "...", "type": "offer" }
+  /// Returns           { "sdp": "...", "type": "answer" }
+  static Future<Map<String, dynamic>> sendWebRTCOffer(
+      String sdp, String type) async {
     final base = await getBaseUrl();
-    return "$base/frame";
+    final response = await http
+        .post(
+          Uri.parse("$base/webrtc/offer"),
+          headers: {"Content-Type": "application/json"},
+          body: jsonEncode({"sdp": sdp, "type": type}),
+        )
+        .timeout(const Duration(seconds: 10));
+
+    if (response.statusCode == 200) {
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    }
+    throw Exception("WebRTC offer failed: ${response.statusCode}");
   }
 
   // ── health check ──────────────────────────────────────────────────────────
@@ -97,7 +112,6 @@ class ApiService {
     await _post("/manual-mode", body: {"enabled": enabled});
   }
 
-  // x/y in [-1.0, 1.0] — backend converts to linear_v + angular_w → Arduino
   static Future<void> sendDrive(double x, double y) async {
     await _post("/manual-drive", body: {"x": x, "y": y}, timeoutMs: 300);
   }

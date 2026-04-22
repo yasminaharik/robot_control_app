@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'services/api_service.dart';
 import 'settings_screen.dart';
@@ -151,97 +151,153 @@ class RobotControlPage extends StatefulWidget {
 class _RobotControlPageState extends State<RobotControlPage>
     with SingleTickerProviderStateMixin {
 
+  // ── bluetooth ──────────────────────────────────────────────────────────────
   BluetoothConnection? _connection;
   bool _isConnected = false;
 
+  // ── vision state ──────────────────────────────────────────────────────────
   List<dynamic> _detections = [];
   Map<String, dynamic>? _selectedTarget;
   bool _cameraActive = false;
-
-  Uint8List? _frameBytes;
-  Timer? _frameTimer;
   Timer? _stateTimer;
-  bool _fetchingFrame = false;
-  bool _pollingState  = false;
+  bool _pollingState = false;
 
-  String _loadingMsg = "Waiting for first frame...";
-  int _failedFrameAttempts = 0;
+  // ── WebRTC ────────────────────────────────────────────────────────────────
+  RTCPeerConnection? _peerConnection;
+  final RTCVideoRenderer _videoRenderer = RTCVideoRenderer();
+  bool _webrtcConnected = false;
+  bool _webrtcConnecting = false;
+  String _webrtcStatus = "Tap to connect camera";
 
+  // ── joystick ───────────────────────────────────────────────────────────────
   Timer? _driveTimer;
   double _joystickX    = 0;
   double _joystickY    = 0;
   bool _joystickActive = false;
   bool _sendingDrive   = false;
 
+  // ── mode ───────────────────────────────────────────────────────────────────
   bool _autonomousMode = false;
 
+  // ── video tap key ──────────────────────────────────────────────────────────
   final GlobalKey _videoKey = GlobalKey();
+
+  // ── tabs ───────────────────────────────────────────────────────────────────
   late TabController _tabController;
 
   @override
   void initState() {
     super.initState();
     _tabController = TabController(length: 2, vsync: this);
+    _videoRenderer.initialize();
 
-    _frameTimer = Timer.periodic(
-        const Duration(milliseconds: 80), (_) => _fetchFrame());
     _stateTimer = Timer.periodic(
         const Duration(milliseconds: 600), (_) => _pollState());
     _driveTimer = Timer.periodic(
         const Duration(milliseconds: 100), (_) => _sendDrive());
 
-    _fetchFrame();
     _pollState();
+    // auto-start WebRTC connection
+    _startWebRTC();
   }
 
   @override
   void dispose() {
-    _frameTimer?.cancel();
     _stateTimer?.cancel();
     _driveTimer?.cancel();
     _tabController.dispose();
     _connection?.dispose();
+    _stopWebRTC();
+    _videoRenderer.dispose();
     ApiService.stopDrive();
     ApiService.setManualMode(false);
     super.dispose();
   }
 
-  Future<void> _fetchFrame() async {
-    if (_fetchingFrame) return;
-    _fetchingFrame = true;
-    try {
-      final frameUrl = await ApiService.getFrameUrl();
-      final response = await http
-          .get(Uri.parse(frameUrl))
-          .timeout(const Duration(milliseconds: 600));
+  // ── WebRTC ────────────────────────────────────────────────────────────────
+  Future<void> _startWebRTC() async {
+    if (_webrtcConnecting || _webrtcConnected) return;
+    setState(() {
+      _webrtcConnecting = true;
+      _webrtcStatus = "Connecting...";
+    });
 
-      if (response.statusCode == 200 && mounted) {
-        setState(() {
-          _frameBytes = response.bodyBytes;
-          _failedFrameAttempts = 0;
-          _loadingMsg = "";
-        });
-        _frameTimer?.cancel();
-        _frameTimer = Timer.periodic(
-            const Duration(milliseconds: 150), (_) => _fetchFrame());
-      } else if (response.statusCode == 404) {
-        _failedFrameAttempts++;
-        if (mounted) {
-          setState(() => _loadingMsg = _failedFrameAttempts < 10
-              ? "YOLO warming up..."
-              : "Waiting for camera frame...");
+    try {
+      // create peer connection
+      final config = {
+        'iceServers': [
+          {'urls': 'stun:stun.l.google.com:19302'}
+        ]
+      };
+
+      _peerConnection = await createPeerConnection(config);
+
+      // listen for remote stream
+      _peerConnection!.onTrack = (RTCTrackEvent event) {
+        if (event.streams.isNotEmpty) {
+          setState(() {
+            _videoRenderer.srcObject = event.streams[0];
+            _webrtcConnected = true;
+            _webrtcConnecting = false;
+            _webrtcStatus = "Connected";
+          });
         }
-      }
+      };
+
+      _peerConnection!.onIceConnectionState = (state) {
+        if (state == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+            state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
+          setState(() {
+            _webrtcConnected = false;
+            _webrtcStatus = "Disconnected — tap to reconnect";
+          });
+        }
+      };
+
+      // add transceiver to receive video
+      await _peerConnection!.addTransceiver(
+        kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
+        init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
+      );
+
+      // create offer
+      final offer = await _peerConnection!.createOffer();
+      await _peerConnection!.setLocalDescription(offer);
+
+      // send offer to Pi, get answer
+      final answer = await ApiService.sendWebRTCOffer(
+          offer.sdp!, offer.type!);
+
+      // set remote description
+      await _peerConnection!.setRemoteDescription(
+        RTCSessionDescription(answer['sdp'], answer['type']),
+      );
+
     } catch (e) {
-      _failedFrameAttempts++;
-      if (mounted) {
-        setState(() => _loadingMsg = "Connecting to backend...");
-      }
-    } finally {
-      _fetchingFrame = false;
+      setState(() {
+        _webrtcConnecting = false;
+        _webrtcConnected = false;
+        _webrtcStatus = "Failed — tap to retry";
+      });
     }
   }
 
+  Future<void> _stopWebRTC() async {
+    await _peerConnection?.close();
+    _peerConnection = null;
+    _videoRenderer.srcObject = null;
+  }
+
+  Future<void> _retryWebRTC() async {
+    await _stopWebRTC();
+    setState(() {
+      _webrtcConnected = false;
+      _webrtcConnecting = false;
+    });
+    await _startWebRTC();
+  }
+
+  // ── state poll ─────────────────────────────────────────────────────────────
   Future<void> _pollState() async {
     if (_pollingState) return;
     _pollingState = true;
@@ -261,6 +317,30 @@ class _RobotControlPageState extends State<RobotControlPage>
     }
   }
 
+  // ── tap on video ───────────────────────────────────────────────────────────
+  Future<void> _onVideoTap(TapUpDetails details) async {
+    final box = _videoKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return;
+    final size = box.size;
+    const frameW = 640.0;
+    const frameH = 480.0;
+    final x = (details.localPosition.dx / size.width  * frameW).round();
+    final y = (details.localPosition.dy / size.height * frameH).round();
+    final result = await ApiService.selectTargetByPoint(x, y);
+    if (!mounted) return;
+    setState(() => _selectedTarget = result);
+    if (result == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("No object found there — tap on a bounding box"),
+          duration: Duration(seconds: 1),
+          backgroundColor: Color(0xFF1E1E2E),
+        ),
+      );
+    }
+  }
+
+  // ── joystick ───────────────────────────────────────────────────────────────
   void _onJoystickMove(double x, double y) {
     _joystickX = x;
     _joystickY = y;
@@ -285,6 +365,7 @@ class _RobotControlPageState extends State<RobotControlPage>
     }
   }
 
+  // ── mode toggle ────────────────────────────────────────────────────────────
   Future<void> _onModeToggle(bool autonomous) async {
     setState(() => _autonomousMode = autonomous);
     if (autonomous) {
@@ -295,28 +376,7 @@ class _RobotControlPageState extends State<RobotControlPage>
     }
   }
 
-  Future<void> _onVideoTap(TapUpDetails details) async {
-    final box = _videoKey.currentContext?.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final size = box.size;
-    const frameW = 640.0;
-    const frameH = 480.0;
-    final x = (details.localPosition.dx / size.width  * frameW).round();
-    final y = (details.localPosition.dy / size.height * frameH).round();
-    final result = await ApiService.selectTargetByPoint(x, y);
-    if (!mounted) return;
-    setState(() => _selectedTarget = result);
-    if (result == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("No object found there — tap on a bounding box"),
-          duration: Duration(seconds: 1),
-          backgroundColor: Color(0xFF1E1E2E),
-        ),
-      );
-    }
-  }
-
+  // ── bluetooth ──────────────────────────────────────────────────────────────
   Future<void> _connectToRobot() async {
     const address = "24:6F:28:AB:CD:EF"; // ⚠️ change to your ESP32 MAC
     try {
@@ -327,6 +387,7 @@ class _RobotControlPageState extends State<RobotControlPage>
     }
   }
 
+  // ── fetch ──────────────────────────────────────────────────────────────────
   void _onFetch() {
     if (_selectedTarget == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -346,6 +407,7 @@ class _RobotControlPageState extends State<RobotControlPage>
     );
   }
 
+  // ── stop ───────────────────────────────────────────────────────────────────
   void _onStop() {
     _joystickX = 0;
     _joystickY = 0;
@@ -360,25 +422,18 @@ class _RobotControlPageState extends State<RobotControlPage>
     );
   }
 
-  // ── open settings and restart polling when back ────────────────────────────
+  // ── settings ───────────────────────────────────────────────────────────────
   Future<void> _openSettings() async {
     await Navigator.push(
       context,
       MaterialPageRoute(builder: (_) => const SettingsScreen()),
     );
-    // reset frame so it reconnects with new IP
-    setState(() {
-      _frameBytes = null;
-      _failedFrameAttempts = 0;
-      _loadingMsg = "Connecting to backend...";
-    });
-    _frameTimer?.cancel();
-    _frameTimer = Timer.periodic(
-        const Duration(milliseconds: 80), (_) => _fetchFrame());
-    _fetchFrame();
+    // reconnect WebRTC with new IP
+    await _retryWebRTC();
     _pollState();
   }
 
+  // ── build ──────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -436,11 +491,9 @@ class _RobotControlPageState extends State<RobotControlPage>
                   size: 22),
             ),
           ),
-          // ── settings icon ────────────────────────────────────────────────
           IconButton(
             icon: const Icon(Icons.settings, color: Colors.grey, size: 22),
             onPressed: _openSettings,
-            tooltip: "Set backend IP",
           ),
         ],
         bottom: TabBar(
@@ -465,61 +518,61 @@ class _RobotControlPageState extends State<RobotControlPage>
                 // ── CAMERA TAB ─────────────────────────────────────────────
                 Column(
                   children: [
+
+                    // WebRTC video
                     GestureDetector(
                       onTapUp: _onVideoTap,
+                      onDoubleTap: _retryWebRTC,
                       child: Container(
                         key: _videoKey,
                         width: double.infinity,
                         constraints: const BoxConstraints(maxHeight: 240),
                         color: Colors.black,
-                        child: _frameBytes == null
-                            ? SizedBox(
-                                height: 180,
+                        child: _webrtcConnected
+                            ? RTCVideoView(
+                                _videoRenderer,
+                                objectFit: RTCVideoViewObjectFit
+                                    .RTCVideoViewObjectFitContain,
+                              )
+                            : SizedBox(
+                                height: 200,
                                 child: Center(
                                   child: Column(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
-                                      const CircularProgressIndicator(
-                                          color: Color(0xFF00FF88)),
-                                      const SizedBox(height: 12),
-                                      Text(_loadingMsg,
-                                          style: const TextStyle(
-                                              color: Colors.grey,
-                                              fontSize: 12)),
-                                      const SizedBox(height: 6),
+                                      if (_webrtcConnecting)
+                                        const CircularProgressIndicator(
+                                            color: Color(0xFF00FF88))
+                                      else
+                                        const Icon(Icons.videocam_off,
+                                            color: Colors.grey, size: 36),
+                                      const SizedBox(height: 10),
                                       Text(
-                                        "attempt $_failedFrameAttempts",
+                                        _webrtcStatus,
                                         style: const TextStyle(
-                                            color: Color(0xFF333344),
-                                            fontSize: 10),
+                                            color: Colors.grey, fontSize: 12),
                                       ),
-                                      const SizedBox(height: 12),
-                                      // quick link to settings if failing
-                                      if (_failedFrameAttempts > 5)
+                                      if (!_webrtcConnecting)
+                                        const SizedBox(height: 8),
+                                      if (!_webrtcConnecting)
                                         TextButton.icon(
-                                          onPressed: _openSettings,
-                                          icon: const Icon(Icons.settings,
+                                          onPressed: _retryWebRTC,
+                                          icon: const Icon(Icons.refresh,
                                               size: 14,
                                               color: Color(0xFF00FF88)),
-                                          label: const Text(
-                                            "Change IP",
-                                            style: TextStyle(
-                                                color: Color(0xFF00FF88),
-                                                fontSize: 12),
-                                          ),
+                                          label: const Text("Retry",
+                                              style: TextStyle(
+                                                  color: Color(0xFF00FF88),
+                                                  fontSize: 12)),
                                         ),
                                     ],
                                   ),
                                 ),
-                              )
-                            : Image.memory(
-                                _frameBytes!,
-                                fit: BoxFit.contain,
-                                gaplessPlayback: true,
                               ),
                       ),
                     ),
 
+                    // hint
                     Container(
                       color: const Color(0xFF0F0F1A),
                       width: double.infinity,
@@ -529,13 +582,14 @@ class _RobotControlPageState extends State<RobotControlPage>
                         children: [
                           Icon(Icons.touch_app, size: 11, color: Colors.grey),
                           SizedBox(width: 6),
-                          Text("Tap the video to select a target",
+                          Text("Tap to select · Double tap to reconnect",
                               style: TextStyle(
                                   color: Colors.grey, fontSize: 11)),
                         ],
                       ),
                     ),
 
+                    // selected target banner
                     AnimatedSize(
                       duration: const Duration(milliseconds: 200),
                       child: _selectedTarget == null
@@ -673,7 +727,8 @@ class _RobotControlPageState extends State<RobotControlPage>
                                 borderRadius: BorderRadius.circular(12)),
                           ),
                           onPressed: _onStop,
-                          icon: const Icon(Icons.stop_circle_outlined, size: 18),
+                          icon: const Icon(Icons.stop_circle_outlined,
+                              size: 18),
                           label: const Text("STOP",
                               style: TextStyle(
                                 fontSize: 14,
