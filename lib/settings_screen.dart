@@ -85,14 +85,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 letterSpacing: 1.5,
               ),
             ),
-            const SizedBox(height: 8),
-
-            // ── explanation ────────────────────────────────────────────────
-            const Text(
-              "Enter your laptop's WiFi IP address. "
-              "Make sure your phone and laptop are on the same WiFi network.",
-              style: TextStyle(color: Colors.grey, fontSize: 12),
-            ),
             const SizedBox(height: 20),
 
             // ── IP input ───────────────────────────────────────────────────
@@ -183,54 +175,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                 ),
               ),
-
-            const SizedBox(height: 32),
-
-            // ── how to find IP ─────────────────────────────────────────────
-            const Text(
-              "HOW TO FIND YOUR LAPTOP'S IP",
-              style: TextStyle(
-                color: Colors.grey,
-                fontSize: 11,
-                letterSpacing: 1.5,
-              ),
-            ),
-            const SizedBox(height: 10),
-            _ipStep("Windows",
-                "Open Command Prompt → type ipconfig → look for 'Wireless LAN adapter Wi-Fi' → IPv4 Address"),
-            _ipStep("Mac / Linux",
-                "Open Terminal → type ifconfig | grep 'inet ' → use the address next to en0"),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _ipStep(String os, String instruction) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 10),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1E1E2E),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Text(os,
-                style: const TextStyle(
-                    color: Color(0xFF00FF88),
-                    fontSize: 11,
-                    fontFamily: 'monospace')),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(instruction,
-                style:
-                    const TextStyle(color: Colors.grey, fontSize: 12)),
-          ),
-        ],
       ),
     );
   }

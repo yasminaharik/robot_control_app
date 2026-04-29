@@ -1,8 +1,6 @@
 import 'dart:async';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
-import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 import 'services/api_service.dart';
 import 'settings_screen.dart';
 
@@ -29,6 +27,82 @@ class RobotApp extends StatelessWidget {
       home: const RobotControlPage(),
     );
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Bounding box overlay painter
+// ─────────────────────────────────────────────────────────────────────────────
+class BoundingBoxPainter extends CustomPainter {
+  final List<dynamic> detections;
+  final Map<String, dynamic>? selectedTarget;
+  final Size frameSize;
+
+  BoundingBoxPainter({
+    required this.detections,
+    required this.selectedTarget,
+    required this.frameSize,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (detections.isEmpty) return;
+
+    final scaleX = size.width  / frameSize.width;
+    final scaleY = size.height / frameSize.height;
+
+    for (final det in detections) {
+      final box = det["box"];
+      if (box == null || box.length != 4) continue;
+
+      final x1 = (box[0] as num).toDouble() * scaleX;
+      final y1 = (box[1] as num).toDouble() * scaleY;
+      final x2 = (box[2] as num).toDouble() * scaleX;
+      final y2 = (box[3] as num).toDouble() * scaleY;
+
+      final isSelected = selectedTarget != null &&
+          selectedTarget!["track_id"] == det["track_id"];
+
+      final color = isSelected
+          ? const Color(0xFF00FF88)
+          : Colors.white.withOpacity(0.85);
+
+      canvas.drawRect(
+        Rect.fromLTRB(x1, y1, x2, y2),
+        Paint()
+          ..color = color
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = isSelected ? 2.5 : 1.5,
+      );
+
+      final label =
+          "${det["class_name"]} ${((det["confidence"] as num) * 100).toStringAsFixed(0)}%"
+          "${det["track_id"] != null ? " #${det["track_id"]}" : ""}";
+
+      final textPainter = TextPainter(
+        text: TextSpan(
+          text: label,
+          style: TextStyle(
+            color: Colors.black,
+            fontSize: 11,
+            fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      final labelBg = Rect.fromLTWH(
+        x1, y1 - textPainter.height - 4,
+        textPainter.width + 8, textPainter.height + 4,
+      );
+
+      canvas.drawRect(labelBg, Paint()..color = color);
+      textPainter.paint(canvas, Offset(x1 + 4, y1 - textPainter.height - 2));
+    }
+  }
+
+  @override
+  bool shouldRepaint(BoundingBoxPainter old) =>
+      old.detections != detections || old.selectedTarget != selectedTarget;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,14 +225,18 @@ class RobotControlPage extends StatefulWidget {
 class _RobotControlPageState extends State<RobotControlPage>
     with SingleTickerProviderStateMixin {
 
-  // ── bluetooth ──────────────────────────────────────────────────────────────
-  BluetoothConnection? _connection;
-  bool _isConnected = false;
-
   // ── vision state ──────────────────────────────────────────────────────────
   List<dynamic> _detections = [];
   Map<String, dynamic>? _selectedTarget;
   bool _cameraActive = false;
+  int? _frameWidth;
+  int? _frameHeight;
+
+  // ── autonomy state ────────────────────────────────────────────────────────
+  bool _autonomyEnabled = false;
+  String _autonomyStatus = "idle";
+  String _missionPhase = "IDLE";
+
   Timer? _stateTimer;
   bool _pollingState = false;
 
@@ -167,7 +245,7 @@ class _RobotControlPageState extends State<RobotControlPage>
   final RTCVideoRenderer _videoRenderer = RTCVideoRenderer();
   bool _webrtcConnected = false;
   bool _webrtcConnecting = false;
-  String _webrtcStatus = "Tap to connect camera";
+  String _webrtcStatus = "Connecting...";
 
   // ── joystick ───────────────────────────────────────────────────────────────
   Timer? _driveTimer;
@@ -177,14 +255,14 @@ class _RobotControlPageState extends State<RobotControlPage>
   bool _sendingDrive   = false;
 
   // ── mode ───────────────────────────────────────────────────────────────────
-  bool _autonomousMode = false;
+  bool _autonomousMode     = false;
+  bool _manualModeEnabled  = false;
+  bool _demoSequenceRunning = false;
 
-  // ── video tap key ──────────────────────────────────────────────────────────
   final GlobalKey _videoKey = GlobalKey();
-
-  // ── tabs ───────────────────────────────────────────────────────────────────
   late TabController _tabController;
 
+  // ─────────────────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
@@ -192,13 +270,13 @@ class _RobotControlPageState extends State<RobotControlPage>
     _videoRenderer.initialize();
 
     _stateTimer = Timer.periodic(
-        const Duration(milliseconds: 600), (_) => _pollState());
+        const Duration(milliseconds: 200), (_) => _pollState());
     _driveTimer = Timer.periodic(
         const Duration(milliseconds: 100), (_) => _sendDrive());
 
     _pollState();
-    // auto-start WebRTC connection
     _startWebRTC();
+    _enableManualModeWithRetry();
   }
 
   @override
@@ -206,12 +284,25 @@ class _RobotControlPageState extends State<RobotControlPage>
     _stateTimer?.cancel();
     _driveTimer?.cancel();
     _tabController.dispose();
-    _connection?.dispose();
     _stopWebRTC();
     _videoRenderer.dispose();
     ApiService.stopDrive();
     ApiService.setManualMode(false);
     super.dispose();
+  }
+
+  // ── manual mode retry ─────────────────────────────────────────────────────
+  Future<void> _enableManualModeWithRetry() async {
+    if (_autonomousMode) return;
+    for (int attempt = 0; attempt < 10; attempt++) {
+      await Future.delayed(const Duration(seconds: 1));
+      if (!mounted || _autonomousMode) return;
+      try {
+        await ApiService.setManualMode(true);
+        _manualModeEnabled = true;
+        return;
+      } catch (_) {}
+    }
   }
 
   // ── WebRTC ────────────────────────────────────────────────────────────────
@@ -223,16 +314,12 @@ class _RobotControlPageState extends State<RobotControlPage>
     });
 
     try {
-      // create peer connection
       final config = {
-        'iceServers': [
-          {'urls': 'stun:stun.l.google.com:19302'}
-        ]
+        'iceServers': [{'urls': 'stun:stun.l.google.com:19302'}]
       };
 
       _peerConnection = await createPeerConnection(config);
 
-      // listen for remote stream
       _peerConnection!.onTrack = (RTCTrackEvent event) {
         if (event.streams.isNotEmpty) {
           setState(() {
@@ -249,35 +336,29 @@ class _RobotControlPageState extends State<RobotControlPage>
             state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
           setState(() {
             _webrtcConnected = false;
-            _webrtcStatus = "Disconnected — tap to reconnect";
+            _webrtcStatus = "Disconnected";
           });
         }
       };
 
-      // add transceiver to receive video
       await _peerConnection!.addTransceiver(
         kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
         init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
       );
 
-      // create offer
       final offer = await _peerConnection!.createOffer();
       await _peerConnection!.setLocalDescription(offer);
 
-      // send offer to Pi, get answer
-      final answer = await ApiService.sendWebRTCOffer(
-          offer.sdp!, offer.type!);
+      final answer = await ApiService.sendWebRTCOffer(offer.sdp!, offer.type!);
 
-      // set remote description
       await _peerConnection!.setRemoteDescription(
         RTCSessionDescription(answer['sdp'], answer['type']),
       );
-
     } catch (e) {
       setState(() {
         _webrtcConnecting = false;
         _webrtcConnected = false;
-        _webrtcStatus = "Failed — tap to retry";
+        _webrtcStatus = "Failed — tap Retry";
       });
     }
   }
@@ -297,7 +378,7 @@ class _RobotControlPageState extends State<RobotControlPage>
     await _startWebRTC();
   }
 
-  // ── state poll ─────────────────────────────────────────────────────────────
+  // ── poll state ─────────────────────────────────────────────────────────────
   Future<void> _pollState() async {
     if (_pollingState) return;
     _pollingState = true;
@@ -305,10 +386,26 @@ class _RobotControlPageState extends State<RobotControlPage>
       final state = await ApiService.getState();
       if (!mounted) return;
       setState(() {
-        _detections     = state["detections"]     ?? [];
-        _selectedTarget = state["selected_target"];
-        _cameraActive   = state["camera_active"]  ?? false;
+        _detections      = state["detections"]      ?? [];
+        _selectedTarget  = state["selected_target"];
+        _cameraActive    = state["camera_active"]   ?? false;
+        _frameWidth      = state["frame_width"];
+        _frameHeight     = state["frame_height"];
+        _autonomyEnabled = state["autonomy_enabled"] ?? false;
+        _autonomyStatus  = state["autonomy_status"]  ?? "idle";
+        _missionPhase    = state["mission_phase"]    ?? "IDLE";
       });
+
+      // poll demo sequence status to know when to unlock joystick
+      try {
+        final demoStatus = await ApiService.getDemoSequenceStatus();
+        if (mounted) {
+          setState(() {
+            _demoSequenceRunning = demoStatus["running"] == true;
+          });
+        }
+      } catch (_) {}
+
     } catch (_) {
       if (!mounted) return;
       setState(() => _cameraActive = false);
@@ -322,10 +419,11 @@ class _RobotControlPageState extends State<RobotControlPage>
     final box = _videoKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null) return;
     final size = box.size;
-    const frameW = 640.0;
-    const frameH = 480.0;
+    final frameW = (_frameWidth  ?? 640).toDouble();
+    final frameH = (_frameHeight ?? 480).toDouble();
     final x = (details.localPosition.dx / size.width  * frameW).round();
     final y = (details.localPosition.dy / size.height * frameH).round();
+
     final result = await ApiService.selectTargetByPoint(x, y);
     if (!mounted) return;
     setState(() => _selectedTarget = result);
@@ -342,23 +440,30 @@ class _RobotControlPageState extends State<RobotControlPage>
 
   // ── joystick ───────────────────────────────────────────────────────────────
   void _onJoystickMove(double x, double y) {
-    _joystickX = x;
-    _joystickY = y;
-    _joystickActive = true;
+    _joystickX = x; _joystickY = y; _joystickActive = true;
   }
 
   void _onJoystickRelease() {
-    _joystickX = 0;
-    _joystickY = 0;
-    _joystickActive = false;
+    _joystickX = 0; _joystickY = 0; _joystickActive = false;
     ApiService.stopDrive();
   }
 
   Future<void> _sendDrive() async {
-    if (_sendingDrive || !_joystickActive || _autonomousMode) return;
+    if (_sendingDrive || _autonomousMode || _demoSequenceRunning) return;
     _sendingDrive = true;
     try {
-      await ApiService.sendDrive(_joystickX, _joystickY);
+      // make sure manual mode is enabled
+      if (!_manualModeEnabled) {
+        await ApiService.setManualMode(true);
+        _manualModeEnabled = true;
+      }
+      if (_joystickActive) {
+        // send actual joystick command
+        await ApiService.sendDrive(_joystickX, _joystickY);
+      } else {
+        // send zero drive as keepalive so backend doesn't reset manual mode
+        await ApiService.sendDrive(0, 0);
+      }
     } catch (_) {
     } finally {
       _sendingDrive = false;
@@ -371,48 +476,112 @@ class _RobotControlPageState extends State<RobotControlPage>
     if (autonomous) {
       await ApiService.stopDrive();
       await ApiService.setManualMode(false);
+      _manualModeEnabled = false;
     } else {
+      if (_autonomyEnabled) {
+        await ApiService.stopAutonomy(reason: "switched to manual");
+      }
       await ApiService.setManualMode(true);
-    }
-  }
-
-  // ── bluetooth ──────────────────────────────────────────────────────────────
-  Future<void> _connectToRobot() async {
-    const address = "24:6F:28:AB:CD:EF"; // ⚠️ change to your ESP32 MAC
-    try {
-      final conn = await BluetoothConnection.toAddress(address);
-      setState(() { _connection = conn; _isConnected = true; });
-    } catch (_) {
-      setState(() => _isConnected = false);
+      _manualModeEnabled = true;
     }
   }
 
   // ── fetch ──────────────────────────────────────────────────────────────────
-  void _onFetch() {
-    if (_selectedTarget == null) {
+  Future<void> _onFetch() async {
+    if (_autonomousMode) {
+      // AUTO — full autonomous mission
+      if (_selectedTarget == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Select a target first!"),
+            backgroundColor: Color(0xFF3B1E1E),
+          ),
+        );
+        return;
+      }
+      try {
+        await ApiService.startAutonomy();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("🤖 Fetching ${_selectedTarget!["class_name"]}..."),
+            backgroundColor: const Color(0xFF0F2E1A),
+            duration: const Duration(seconds: 2),
+          ),
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Failed to start fetch: $e"),
+            backgroundColor: const Color(0xFF3B1E1E),
+          ),
+        );
+      }
+    } else {
+      // MANUAL — scripted demo pickup sequence
+      try {
+        // make sure manual mode is enabled first
+        if (!_manualModeEnabled) {
+          await ApiService.setManualMode(true);
+          _manualModeEnabled = true;
+        }
+        await ApiService.startDemoFetch();
+        setState(() => _demoSequenceRunning = true);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("🦾 Pickup sequence started — joystick disabled"),
+            backgroundColor: Color(0xFF1A2E1A),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Failed to start pickup: $e"),
+            backgroundColor: const Color(0xFF3B1E1E),
+          ),
+        );
+      }
+    }
+  }
+
+  // ── demo place ─────────────────────────────────────────────────────────────
+  Future<void> _onDemoPlace() async {
+    try {
+      // make sure manual mode is enabled first
+      if (!_manualModeEnabled) {
+        await ApiService.setManualMode(true);
+        _manualModeEnabled = true;
+      }
+      await ApiService.startDemoPlace();
+      setState(() => _demoSequenceRunning = true);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text("Select a target first!"),
-          backgroundColor: Color(0xFF3B1E1E),
+          content: Text("📦 Place sequence started — joystick disabled"),
+          backgroundColor: Color(0xFF1A1A2E),
+          duration: Duration(seconds: 2),
         ),
       );
-      return;
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Failed to start place: $e"),
+          backgroundColor: const Color(0xFF3B1E1E),
+        ),
+      );
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text("🤖 Fetching ${_selectedTarget!["class_name"]}..."),
-        backgroundColor: const Color(0xFF0F2E1A),
-        duration: const Duration(seconds: 2),
-      ),
-    );
   }
 
   // ── stop ───────────────────────────────────────────────────────────────────
-  void _onStop() {
-    _joystickX = 0;
-    _joystickY = 0;
-    _joystickActive = false;
-    ApiService.stopDrive();
+  Future<void> _onStop() async {
+    _joystickX = 0; _joystickY = 0; _joystickActive = false;
+    await ApiService.stopDrive();
+    if (_autonomyEnabled) {
+      await ApiService.stopAutonomy(reason: "user pressed stop");
+    }
+    if (_demoSequenceRunning) {
+      await ApiService.stopDemoSequence();
+      setState(() => _demoSequenceRunning = false);
+    }
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
         content: Text("🛑 Robot stopped"),
@@ -428,12 +597,23 @@ class _RobotControlPageState extends State<RobotControlPage>
       context,
       MaterialPageRoute(builder: (_) => const SettingsScreen()),
     );
-    // reconnect WebRTC with new IP
     await _retryWebRTC();
     _pollState();
   }
 
-  // ── build ──────────────────────────────────────────────────────────────────
+  // ── mission phase label ────────────────────────────────────────────────────
+  String get _missionPhaseLabel {
+    switch (_missionPhase) {
+      case "SEARCH_FOR_TARGET":       return "🔍 Searching...";
+      case "APPROACH_TARGET":         return "➡️ Approaching...";
+      case "FINE_ALIGN_FOR_PICKUP":   return "🎯 Aligning...";
+      case "EXECUTE_PICKUP":          return "🦾 Picking up...";
+      case "VERIFY_PICKUP":           return "✅ Verifying pickup...";
+      default:                        return "";
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -481,16 +661,6 @@ class _RobotControlPageState extends State<RobotControlPage>
               ),
             ],
           ),
-          GestureDetector(
-            onTap: _isConnected ? null : _connectToRobot,
-            child: Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: Icon(Icons.bluetooth,
-                  color: _isConnected
-                      ? const Color(0xFF00FF88) : Colors.grey,
-                  size: 22),
-            ),
-          ),
           IconButton(
             icon: const Icon(Icons.settings, color: Colors.grey, size: 22),
             onPressed: _openSettings,
@@ -518,8 +688,6 @@ class _RobotControlPageState extends State<RobotControlPage>
                 // ── CAMERA TAB ─────────────────────────────────────────────
                 Column(
                   children: [
-
-                    // WebRTC video
                     GestureDetector(
                       onTapUp: _onVideoTap,
                       onDoubleTap: _retryWebRTC,
@@ -529,10 +697,26 @@ class _RobotControlPageState extends State<RobotControlPage>
                         constraints: const BoxConstraints(maxHeight: 240),
                         color: Colors.black,
                         child: _webrtcConnected
-                            ? RTCVideoView(
-                                _videoRenderer,
-                                objectFit: RTCVideoViewObjectFit
-                                    .RTCVideoViewObjectFitContain,
+                            ? Stack(
+                                children: [
+                                  RTCVideoView(
+                                    _videoRenderer,
+                                    objectFit: RTCVideoViewObjectFit
+                                        .RTCVideoViewObjectFitContain,
+                                  ),
+                                  Positioned.fill(
+                                    child: CustomPaint(
+                                      painter: BoundingBoxPainter(
+                                        detections: _detections,
+                                        selectedTarget: _selectedTarget,
+                                        frameSize: Size(
+                                          (_frameWidth  ?? 640).toDouble(),
+                                          (_frameHeight ?? 480).toDouble(),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               )
                             : SizedBox(
                                 height: 200,
@@ -547,14 +731,12 @@ class _RobotControlPageState extends State<RobotControlPage>
                                         const Icon(Icons.videocam_off,
                                             color: Colors.grey, size: 36),
                                       const SizedBox(height: 10),
-                                      Text(
-                                        _webrtcStatus,
-                                        style: const TextStyle(
-                                            color: Colors.grey, fontSize: 12),
-                                      ),
-                                      if (!_webrtcConnecting)
+                                      Text(_webrtcStatus,
+                                          style: const TextStyle(
+                                              color: Colors.grey,
+                                              fontSize: 12)),
+                                      if (!_webrtcConnecting) ...[
                                         const SizedBox(height: 8),
-                                      if (!_webrtcConnecting)
                                         TextButton.icon(
                                           onPressed: _retryWebRTC,
                                           icon: const Icon(Icons.refresh,
@@ -565,6 +747,7 @@ class _RobotControlPageState extends State<RobotControlPage>
                                                   color: Color(0xFF00FF88),
                                                   fontSize: 12)),
                                         ),
+                                      ],
                                     ],
                                   ),
                                 ),
@@ -572,7 +755,6 @@ class _RobotControlPageState extends State<RobotControlPage>
                       ),
                     ),
 
-                    // hint
                     Container(
                       color: const Color(0xFF0F0F1A),
                       width: double.infinity,
@@ -587,6 +769,48 @@ class _RobotControlPageState extends State<RobotControlPage>
                                   color: Colors.grey, fontSize: 11)),
                         ],
                       ),
+                    ),
+
+                    // mission phase banner
+                    AnimatedSize(
+                      duration: const Duration(milliseconds: 200),
+                      child: _autonomyEnabled && _missionPhaseLabel.isNotEmpty
+                          ? Container(
+                              width: double.infinity,
+                              color: const Color(0xFF1A1A0A),
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 14, vertical: 6),
+                              child: Text(
+                                _missionPhaseLabel,
+                                style: const TextStyle(
+                                  color: Color(0xFFFFD700),
+                                  fontSize: 12,
+                                  fontFamily: 'monospace',
+                                ),
+                              ),
+                            )
+                          : const SizedBox.shrink(),
+                    ),
+
+                    // demo sequence banner
+                    AnimatedSize(
+                      duration: const Duration(milliseconds: 200),
+                      child: _demoSequenceRunning
+                          ? Container(
+                              width: double.infinity,
+                              color: const Color(0xFF1A2E1A),
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 14, vertical: 6),
+                              child: const Text(
+                                "🦾 Sequence running — joystick locked",
+                                style: TextStyle(
+                                  color: Color(0xFF00FF88),
+                                  fontSize: 12,
+                                  fontFamily: 'monospace',
+                                ),
+                              ),
+                            )
+                          : const SizedBox.shrink(),
                     ),
 
                     // selected target banner
@@ -684,7 +908,7 @@ class _RobotControlPageState extends State<RobotControlPage>
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
             child: _autonomousMode
 
-                // AUTO MODE
+                // ── AUTO MODE ─────────────────────────────────────────────
                 ? Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
@@ -693,22 +917,34 @@ class _RobotControlPageState extends State<RobotControlPage>
                         height: 52,
                         child: ElevatedButton.icon(
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: _selectedTarget != null
-                                ? const Color(0xFF00FF88)
-                                : const Color(0xFF1E1E2E),
-                            foregroundColor: _selectedTarget != null
-                                ? Colors.black : Colors.grey,
+                            backgroundColor: _autonomyEnabled
+                                ? const Color(0xFFFFD700)
+                                : (_selectedTarget != null
+                                    ? const Color(0xFF00FF88)
+                                    : const Color(0xFF1E1E2E)),
+                            foregroundColor: _autonomyEnabled
+                                ? Colors.black
+                                : (_selectedTarget != null
+                                    ? Colors.black : Colors.grey),
                             shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12)),
                           ),
-                          onPressed: _onFetch,
-                          icon: const Icon(Icons.send, size: 18),
+                          onPressed: _autonomyEnabled ? null : _onFetch,
+                          icon: Icon(
+                            _autonomyEnabled
+                                ? Icons.hourglass_top : Icons.send,
+                            size: 18,
+                          ),
                           label: Text(
-                            _selectedTarget != null
-                                ? "FETCH  ${_selectedTarget!["class_name"].toString().toUpperCase()}"
-                                : "SELECT A TARGET FIRST",
+                            _autonomyEnabled
+                                ? (_missionPhaseLabel.isNotEmpty
+                                    ? _missionPhaseLabel
+                                    : "Mission running...")
+                                : (_selectedTarget != null
+                                    ? "FETCH  ${_selectedTarget!["class_name"].toString().toUpperCase()}"
+                                    : "SELECT A TARGET FIRST"),
                             style: const TextStyle(
-                              fontSize: 14,
+                              fontSize: 13,
                               fontWeight: FontWeight.bold,
                               letterSpacing: 1,
                             ),
@@ -740,72 +976,131 @@ class _RobotControlPageState extends State<RobotControlPage>
                     ],
                   )
 
-                // MANUAL MODE
-                : Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    crossAxisAlignment: CrossAxisAlignment.center,
+                // ── MANUAL MODE ───────────────────────────────────────────
+                : Column(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Joystick(
-                        size: 140,
-                        onMove: _onJoystickMove,
-                        onRelease: _onJoystickRelease,
-                      ),
-                      Column(
-                        mainAxisSize: MainAxisSize.min,
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                        crossAxisAlignment: CrossAxisAlignment.center,
                         children: [
-                          SizedBox(
-                            width: 110,
-                            child: ElevatedButton.icon(
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: _selectedTarget != null
-                                    ? const Color(0xFF00FF88)
-                                    : const Color(0xFF1E1E2E),
-                                foregroundColor: _selectedTarget != null
-                                    ? Colors.black : Colors.grey,
-                                padding: const EdgeInsets.symmetric(
-                                    vertical: 12, horizontal: 8),
-                                shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12)),
-                              ),
-                              onPressed: _onFetch,
-                              icon: const Icon(Icons.send, size: 16),
-                              label: Text(
-                                _selectedTarget != null
-                                    ? "FETCH\n${_selectedTarget!["class_name"].toString().toUpperCase()}"
-                                    : "SELECT\nTARGET",
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.bold,
-                                  letterSpacing: 0.5,
+
+                          // joystick — disabled during demo sequence
+                          Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              Opacity(
+                                opacity: _demoSequenceRunning ? 0.3 : 1.0,
+                                child: Joystick(
+                                  size: 130,
+                                  onMove: _demoSequenceRunning
+                                      ? (x, y) {}
+                                      : _onJoystickMove,
+                                  onRelease: _demoSequenceRunning
+                                      ? () {}
+                                      : _onJoystickRelease,
                                 ),
                               ),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          SizedBox(
-                            width: 110,
-                            child: ElevatedButton.icon(
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFF3B1E1E),
-                                foregroundColor: Colors.redAccent,
-                                padding: const EdgeInsets.symmetric(
-                                    vertical: 12, horizontal: 8),
-                                shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(12)),
-                              ),
-                              onPressed: _onStop,
-                              icon: const Icon(
-                                  Icons.stop_circle_outlined, size: 16),
-                              label: const Text("STOP",
+                              if (_demoSequenceRunning)
+                                const Text(
+                                  "SEQUENCE\nRUNNING",
+                                  textAlign: TextAlign.center,
                                   style: TextStyle(
-                                    fontSize: 13,
+                                    color: Color(0xFFFFD700),
+                                    fontSize: 10,
                                     fontWeight: FontWeight.bold,
-                                    letterSpacing: 2,
-                                  )),
-                            ),
+                                    letterSpacing: 1,
+                                  ),
+                                ),
+                            ],
+                          ),
+
+                          // PICK UP + STOP buttons
+                          Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                width: 110,
+                                child: ElevatedButton.icon(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: _demoSequenceRunning
+                                        ? const Color(0xFF2E2E1A)
+                                        : const Color(0xFF1A2E1A),
+                                    foregroundColor: _demoSequenceRunning
+                                        ? Colors.grey
+                                        : const Color(0xFF00FF88),
+                                    padding: const EdgeInsets.symmetric(
+                                        vertical: 10, horizontal: 8),
+                                    shape: RoundedRectangleBorder(
+                                        borderRadius:
+                                            BorderRadius.circular(12)),
+                                  ),
+                                  onPressed:
+                                      _demoSequenceRunning ? null : _onFetch,
+                                  icon: const Icon(Icons.download, size: 16),
+                                  label: const Text("PICK UP",
+                                      textAlign: TextAlign.center,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.bold,
+                                      )),
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              SizedBox(
+                                width: 110,
+                                child: ElevatedButton.icon(
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: const Color(0xFF3B1E1E),
+                                    foregroundColor: Colors.redAccent,
+                                    padding: const EdgeInsets.symmetric(
+                                        vertical: 10, horizontal: 8),
+                                    shape: RoundedRectangleBorder(
+                                        borderRadius:
+                                            BorderRadius.circular(12)),
+                                  ),
+                                  onPressed: _onStop,
+                                  icon: const Icon(
+                                      Icons.stop_circle_outlined, size: 16),
+                                  label: const Text("STOP",
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.bold,
+                                        letterSpacing: 2,
+                                      )),
+                                ),
+                              ),
+                            ],
                           ),
                         ],
+                      ),
+
+                      const SizedBox(height: 8),
+
+                      // PUT DOWN button — full width below
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: _demoSequenceRunning
+                                ? const Color(0xFF1A1A2E).withOpacity(0.4)
+                                : const Color(0xFF1A1A2E),
+                            foregroundColor: _demoSequenceRunning
+                                ? Colors.grey
+                                : const Color(0xFF7B9FFF),
+                            padding:
+                                const EdgeInsets.symmetric(vertical: 10),
+                            shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10)),
+                          ),
+                          onPressed:
+                              _demoSequenceRunning ? null : _onDemoPlace,
+                          icon: const Icon(Icons.upload, size: 16),
+                          label: const Text("PUT DOWN",
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold)),
+                        ),
                       ),
                     ],
                   ),

@@ -48,16 +48,13 @@ class ApiService {
     return http.delete(Uri.parse("$base$path"));
   }
 
-  // ── WebRTC signaling ──────────────────────────────────────────────────────
-  /// Send SDP offer to Pi, get SDP answer back
-  /// POST /webrtc/offer  { "sdp": "...", "type": "offer" }
-  /// Returns           { "sdp": "...", "type": "answer" }
+  // ── WebRTC — raw video, boxes drawn in Flutter ────────────────────────────
   static Future<Map<String, dynamic>> sendWebRTCOffer(
       String sdp, String type) async {
     final base = await getBaseUrl();
     final response = await http
         .post(
-          Uri.parse("$base/webrtc/offer"),
+          Uri.parse("$base/webrtc/offer-raw"),
           headers: {"Content-Type": "application/json"},
           body: jsonEncode({"sdp": sdp, "type": type}),
         )
@@ -69,7 +66,7 @@ class ApiService {
     throw Exception("WebRTC offer failed: ${response.statusCode}");
   }
 
-  // ── health check ──────────────────────────────────────────────────────────
+  // ── health ────────────────────────────────────────────────────────────────
   static Future<bool> checkHealth() async {
     try {
       final res = await _get("/health", timeoutMs: 3000);
@@ -118,5 +115,68 @@ class ApiService {
 
   static Future<void> stopDrive() async {
     await _post("/manual-stop", timeoutMs: 300);
+  }
+
+  // ── autonomous fetch ──────────────────────────────────────────────────────
+  static Future<Map<String, dynamic>> startAutonomy() async {
+    final res = await _post(
+      "/autonomy/start",
+      body: {"use_selected_target": true},
+      timeoutMs: 3000,
+    );
+    if (res.statusCode == 200) {
+      return jsonDecode(res.body) as Map<String, dynamic>;
+    }
+    throw Exception("Failed to start autonomy: ${res.body}");
+  }
+
+  static Future<void> stopAutonomy({String? reason}) async {
+    await _post(
+      "/autonomy/stop",
+      body: {"reason": reason ?? "user cancelled"},
+      timeoutMs: 3000,
+    );
+  }
+
+  static Future<Map<String, dynamic>> getAutonomyStatus() async {
+    final res = await _get("/autonomy/status");
+    if (res.statusCode == 200) {
+      return jsonDecode(res.body) as Map<String, dynamic>;
+    }
+    throw Exception("Failed to get autonomy status");
+  }
+
+  // ── demo sequences ────────────────────────────────────────────────────────
+  /// Triggers the demo pickup sequence (arm down → grip open → nudge forward
+  /// → grip close → arm up)
+  static Future<void> startDemoFetch() async {
+    final res = await _post("/demo-fetch/start", timeoutMs: 3000);
+    if (res.statusCode != 200) {
+      final body = jsonDecode(res.body);
+      throw Exception(body["detail"] ?? "Failed to start demo fetch");
+    }
+  }
+
+  /// Triggers the demo place sequence (arm down → grip open)
+  static Future<void> startDemoPlace() async {
+    final res = await _post("/demo-place/start", timeoutMs: 3000);
+    if (res.statusCode != 200) {
+      final body = jsonDecode(res.body);
+      throw Exception(body["detail"] ?? "Failed to start demo place");
+    }
+  }
+
+  /// Stop any running demo sequence
+  static Future<void> stopDemoSequence() async {
+    await _post("/demo-sequence/stop", timeoutMs: 1000);
+  }
+
+  /// Get current demo sequence status
+  static Future<Map<String, dynamic>> getDemoSequenceStatus() async {
+    final res = await _get("/demo-sequence/status");
+    if (res.statusCode == 200) {
+      return jsonDecode(res.body) as Map<String, dynamic>;
+    }
+    throw Exception("Failed to get demo sequence status");
   }
 }
